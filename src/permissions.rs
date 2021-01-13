@@ -1,4 +1,4 @@
-use winapi::winnt;
+use winapi::um::winnt;
 pub const PROT_NONE: u32 = winnt::PAGE_NOACCESS;
 pub const PROT_READ: u32 = winnt::PAGE_READONLY;
 pub const PROT_WRITE: u32 = winnt::PAGE_READWRITE;

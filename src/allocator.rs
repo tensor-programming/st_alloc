@@ -163,12 +163,14 @@ impl Allocator {
     }
 
     unsafe fn map(size: usize, perms: u32, commit: bool) -> Option<*mut u8> {
-        use kernel32::VirtualAlloc;
-        use winapi::winnt::{MEM_COMMIT, MEM_RESERVE};
+        use winapi::um::{
+            memoryapi::VirtualAlloc,
+            winnt::{MEM_COMMIT, MEM_RESERVE},
+        };
 
         let typ = MEM_RESERVE | if commit { MEM_COMMIT } else { 0 };
 
-        let ptr = VirtualAlloc(ptr::null_mut(), size as WindowsSize, typ, perms) as *mut u8;
+        let ptr = VirtualAlloc(ptr::null_mut(), size as usize, typ, perms) as *mut u8;
 
         if ptr.is_null() {
             None
@@ -178,8 +180,8 @@ impl Allocator {
     }
 
     unsafe fn unmap(ptr: *mut u8, _size: usize) {
-        use kernel32::{GetLastError, VirtualFree};
-        use winapi::winnt::MEM_RELEASE;
+        use winapi::um::winnt::MEM_RELEASE;
+        use winapi::um::{errhandlingapi::GetLastError, memoryapi::VirtualFree};
 
         let ret = VirtualFree(ptr as *mut _, 0, MEM_RELEASE);
         assert_ne!(
@@ -192,14 +194,15 @@ impl Allocator {
     }
 
     unsafe fn protect(ptr: *mut u8, size: usize, perm: Perm) {
-        use kernel32::{GetLastError, VirtualProtect};
+        use winapi::shared::minwindef::DWORD;
+        use winapi::um::{errhandlingapi::GetLastError, memoryapi::VirtualProtect};
 
-        let mut _old_perm: winapi::DWORD = 0;
+        let mut _old_perm: DWORD = 0;
         #[cfg(target_pointer_width = "64")]
         type U = u64;
         #[cfg(target_pointer_width = "32")]
         type U = u32;
-        let ret = VirtualProtect(ptr as *mut _, size as U, perm, &mut _old_perm as *mut _);
+        let ret = VirtualProtect(ptr as *mut _, size as usize, perm, &mut _old_perm as *mut _);
         assert_ne!(
             ret,
             0,
@@ -310,18 +313,16 @@ fn next_multiple(size: usize, unit: usize) -> usize {
 }
 
 unsafe fn commit(ptr: *mut u8, size: usize, perms: u32) {
-    use kernel32::VirtualAlloc;
-    use winapi::winnt::MEM_COMMIT;
+    use winapi::um::{memoryapi::VirtualAlloc, winnt::MEM_COMMIT};
 
-    let ret = VirtualAlloc(ptr as *mut _, size as WindowsSize, MEM_COMMIT, perms);
+    let ret = VirtualAlloc(ptr as *mut _, size as usize, MEM_COMMIT, perms);
     assert_eq!(ret as *mut u8, ptr);
 }
 
 unsafe fn uncommit(ptr: *mut u8, size: usize) {
-    use kernel32::{GetLastError, VirtualFree};
-    use winapi::winnt::MEM_DECOMMIT;
+    use winapi::um::{errhandlingapi::GetLastError, memoryapi::VirtualFree, winnt::MEM_DECOMMIT};
 
-    let ret = VirtualFree(ptr as *mut _, size as WindowsSize, MEM_DECOMMIT);
+    let ret = VirtualFree(ptr as *mut _, size as usize, MEM_DECOMMIT);
     assert_ne!(
         ret,
         0,
@@ -333,14 +334,17 @@ unsafe fn uncommit(ptr: *mut u8, size: usize) {
 }
 
 unsafe fn protect(ptr: *mut u8, size: usize, perm: Perm) {
-    use kernel32::{GetLastError, VirtualProtect};
+    use winapi::{
+        shared::minwindef::DWORD,
+        um::{errhandlingapi::GetLastError, memoryapi::VirtualProtect},
+    };
 
-    let mut _old_perm: winapi::DWORD = 0;
+    let mut _old_perm: DWORD = 0;
     #[cfg(target_pointer_width = "64")]
     type U = u64;
     #[cfg(target_pointer_width = "32")]
     type U = u32;
-    let ret = VirtualProtect(ptr as *mut _, size as U, perm, &mut _old_perm as *mut _);
+    let ret = VirtualProtect(ptr as *mut _, size as usize, perm, &mut _old_perm as *mut _);
     assert_ne!(
         ret,
         0,
@@ -375,16 +379,19 @@ mod tests {
     }
 
     fn assert_block_perm<P: IntoPtrU8>(ptr: P, size: usize, perm: Perm) {
+        use winapi::um::memoryapi::VirtualQuery;
+
         let ptr = ptr.into_ptr_u8();
         unsafe {
             use core::mem;
-            let mut meminfo: winapi::winnt::MEMORY_BASIC_INFORMATION = mem::uninitialized();
-            let mbi_size = mem::size_of::<winapi::winnt::MEMORY_BASIC_INFORMATION>();
-            let ret =
-                kernel32::VirtualQuery(ptr as *mut _, &mut meminfo as *mut _, mbi_size as u64);
+            let mut meminfo: winapi::um::winnt::MEMORY_BASIC_INFORMATION =
+                mem::MaybeUninit::uninit().assume_init();
+            let mbi_size = mem::size_of::<winapi::um::winnt::MEMORY_BASIC_INFORMATION>();
+
+            let ret = VirtualQuery(ptr as *mut _, &mut meminfo as *mut _, mbi_size as usize);
             assert_ne!(ret, 0);
 
-            assert!(meminfo.RegionSize >= size as u64);
+            assert!(meminfo.RegionSize >= size as usize);
             assert_eq!(meminfo.Protect, perm);
         }
     }
@@ -511,6 +518,14 @@ mod tests {
             test(true, false, true);
             test(false, true, true);
             test(true, true, true);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_unmap_panic_unaligned() {
+        unsafe {
+            Allocator::unmap((pagesize() / 2) as *mut u8, pagesize());
         }
     }
 }
