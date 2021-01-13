@@ -211,6 +211,48 @@ impl Allocator {
             GetLastError()
         );
     }
+
+    unsafe fn realloc(&mut self, ptr: *mut u8, layout: Layout, new_size: usize) -> Option<*mut u8> {
+        use core::cmp;
+
+        debug_assert!(
+            layout.size() > 0,
+            "realloc: size of layout must be non-zero"
+        );
+        debug_assert!(new_size > 0, "realloc: new_size must be non-zero");
+
+        let old_size = next_multiple(layout.size(), self.pagesize);
+        let new_size = next_multiple(new_size, self.pagesize);
+
+        if old_size == new_size {
+            return Some(ptr);
+        }
+
+        let new_size = next_multiple(new_size, layout.align());
+        let new_layout = Layout::from_size_align(new_size, layout.align()).unwrap();
+
+        let new_ptr = Allocator::alloc(self, new_layout);
+
+        let fix_old_perms = !self.read;
+        let fix_new_perms = !self.write;
+        if fix_old_perms {
+            protect(ptr, old_size, get_perms(true, self.write, self.exec));
+        }
+        if fix_new_perms {
+            protect(new_ptr, new_size, get_perms(self.read, true, self.exec));
+        }
+        ptr::copy_nonoverlapping(
+            ptr as *const u8,
+            new_ptr as *mut u8,
+            cmp::min(old_size, new_size),
+        );
+        Allocator::dealloc(self, ptr, layout);
+        if fix_new_perms {
+            protect(new_ptr, new_size, self.permissions);
+        }
+
+        Some(new_ptr)
+    }
 }
 
 unsafe impl GlobalAlloc for Allocator {
@@ -290,6 +332,27 @@ unsafe fn uncommit(ptr: *mut u8, size: usize) {
     );
 }
 
+unsafe fn protect(ptr: *mut u8, size: usize, perm: Perm) {
+    use kernel32::{GetLastError, VirtualProtect};
+
+    let mut _old_perm: winapi::DWORD = 0;
+    #[cfg(target_pointer_width = "64")]
+    type U = u64;
+    #[cfg(target_pointer_width = "32")]
+    type U = u32;
+    let ret = VirtualProtect(ptr as *mut _, size as U, perm, &mut _old_perm as *mut _);
+    assert_ne!(
+        ret,
+        0,
+        "Call to VirtualProtect({:?}, {}, {}, {}) failed with error code {}.",
+        ptr,
+        size,
+        perm,
+        _old_perm,
+        GetLastError()
+    );
+}
+
 mod tests {
     use super::*;
 
@@ -311,6 +374,21 @@ mod tests {
         }
     }
 
+    fn assert_block_perm<P: IntoPtrU8>(ptr: P, size: usize, perm: Perm) {
+        let ptr = ptr.into_ptr_u8();
+        unsafe {
+            use core::mem;
+            let mut meminfo: winapi::winnt::MEMORY_BASIC_INFORMATION = mem::uninitialized();
+            let mbi_size = mem::size_of::<winapi::winnt::MEMORY_BASIC_INFORMATION>();
+            let ret =
+                kernel32::VirtualQuery(ptr as *mut _, &mut meminfo as *mut _, mbi_size as u64);
+            assert_ne!(ret, 0);
+
+            assert!(meminfo.RegionSize >= size as u64);
+            assert_eq!(meminfo.Protect, perm);
+        }
+    }
+
     fn test_valid_map_address(ptr: *mut u8) {
         assert!(ptr as usize > 0, "ptr: {:?}", ptr);
         assert!(ptr as usize % pagesize() == 0, "ptr: {:?}", ptr);
@@ -323,6 +401,32 @@ mod tests {
         }
     }
 
+    unsafe fn test_write<P: IntoPtrU8>(ptr: P, size: usize) {
+        let ptr = ptr.into_ptr_u8();
+        for i in 0..size {
+            *ptr.offset(i as isize) = (i & 0xff) as u8;
+        }
+    }
+
+    unsafe fn test_read<P: IntoPtrU8>(ptr: P, size: usize) {
+        let ptr = ptr.into_ptr_u8();
+        for i in 0..size {
+            let got = *ptr.offset(i as isize);
+            let want = (i & 0xff) as u8;
+            assert_eq!(
+                got, want,
+                "mismatch at byte {} in block {:?}: got {}, want {}",
+                i, ptr, got, want
+            );
+        }
+    }
+
+    unsafe fn test_write_read<P: IntoPtrU8>(ptr: P, size: usize) {
+        let ptr = ptr.into_ptr_u8();
+        test_write(ptr, size);
+        test_read(ptr, size);
+    }
+
     #[test]
     fn test_map() {
         unsafe {
@@ -332,6 +436,81 @@ mod tests {
             commit(ptr, pagesize(), PROT_READ_WRITE);
             test_zero_filled(ptr, pagesize());
             Allocator::unmap(ptr as *mut u8, 16 * pagesize());
+        }
+    }
+
+    #[test]
+    fn test_realloc() {
+        unsafe fn test(read: bool, write: bool, exec: bool) {
+            let builder = AllocBuilder::default().read(read).write(write).exec(exec);
+
+            let builder = builder.commit(true);
+            let mut alloc = builder.build();
+
+            let permissions = get_perms(read, write, exec);
+            let test_conts = |ptr: *mut u8, size: usize| {
+                if read && write {
+                    test_write_read(ptr, size);
+                } else if read {
+                    test_zero_filled(ptr, size);
+                } else if write {
+                    test_write(ptr, size);
+                }
+            };
+
+            let small = Layout::array::<u8>(1).unwrap();
+            let medium = Layout::array::<u8>(2048).unwrap();
+            let large = Layout::array::<u8>(4096).unwrap();
+
+            let ptr = Allocator::alloc(&mut alloc, medium.clone());
+            test_valid_map_address(ptr);
+
+            if read {
+                test_zero_filled(ptr, large.size());
+            }
+
+            test_conts(ptr.into_ptr_u8(), large.size());
+
+            assert_block_perm(ptr, medium.size(), permissions);
+            if read && write {
+                test_read(ptr, small.size());
+            }
+            test_conts(ptr.into_ptr_u8(), small.size());
+
+            assert_block_perm(ptr, small.size(), permissions);
+
+            if read && write {
+                test_read(ptr, small.size());
+            }
+
+            test_conts(ptr.into_ptr_u8(), large.size());
+
+            assert_block_perm(ptr, large.size(), permissions);
+
+            let _ = ptr;
+
+            let ptr = Allocator::realloc(&mut alloc, ptr, large.clone(), small.size()).unwrap();
+
+            if read && write {
+                test_read(ptr, small.size());
+            }
+
+            test_conts(ptr.into_ptr_u8(), small.size());
+
+            assert_block_perm(ptr, small.size(), permissions);
+
+            Allocator::dealloc(&alloc, ptr, small.clone());
+        }
+
+        unsafe {
+            test(false, false, false);
+            test(true, false, false);
+            test(false, true, false);
+            test(false, false, true);
+            test(true, true, false);
+            test(true, false, true);
+            test(false, true, true);
+            test(true, true, true);
         }
     }
 }
